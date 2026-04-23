@@ -170,13 +170,18 @@ class SelfSupervisedRFAnomaly:
         set_random_seed(self.random_state)
         train_benign = X_train_benign
         val_benign = X_val_benign
+        self._log(
+            f"[rf_pipeline] fit start: benign_train={len(train_benign)}, benign_val={len(val_benign)}"
+        )
 
         if len(train_benign) > 450000:
+            self._log("[rf_pipeline] downsampling benign train to 450000")
             train_benign = train_benign.sample(
                 n=450000,
                 random_state=self.random_state,
             )
         if len(val_benign) > 120000:
+            self._log("[rf_pipeline] downsampling benign val to 120000")
             val_benign = val_benign.sample(
                 n=120000,
                 random_state=self.random_state,
@@ -186,25 +191,30 @@ class SelfSupervisedRFAnomaly:
             train_benign,
             self.config.exclude_columns,
         )
+        self._log(f"[rf_pipeline] selected features: {len(self.feature_columns_)}")
         self.preprocessor_ = build_tabular_preprocessor(
             train_benign,
             self.feature_columns_,
             scale_numeric=self.scale_numeric,
         )
 
-        self._log("Fitting RF anomaly preprocessor")
+        self._log("[rf_pipeline] starting tabular preprocessing")
         train_benign = sanitize_numeric_features(train_benign, self.feature_columns_)
         train_prepared = self.preprocessor_.fit_transform(train_benign[self.feature_columns_])
+        self._log("[rf_pipeline] finished tabular preprocessing")
+        self._log(f"[rf_pipeline] train matrix shape: {train_prepared.shape}")
         svd_components = min(
             self.config.n_svd_components,
             max(2, train_prepared.shape[1] - 1),
         )
+        self._log(f"[rf_pipeline] SVD components: {svd_components}")
 
         self.svd_ = TruncatedSVD(
             n_components=svd_components,
             random_state=self.random_state,
         )
         train_svd = self.svd_.fit_transform(train_prepared)
+        self._log(f"[rf_pipeline] SVD output shape: {train_svd.shape}")
 
         self.rff_ = RBFSampler(
             gamma=self.config.rff_gamma,
@@ -212,9 +222,11 @@ class SelfSupervisedRFAnomaly:
             random_state=self.random_state,
         )
         train_rff = self._to_dense(self.rff_.fit_transform(train_svd)).astype(np.float32)
+        self._log(f"[rf_pipeline] RFF output shape: {train_rff.shape}")
 
         self.rotations_ = self._make_rotations(train_rff.shape[1])
         X_self_supervised, y_self_supervised = self._build_self_supervised_dataset(train_rff)
+        self._log(f"[rf_pipeline] self-supervised dataset shape: {X_self_supervised.shape}")
 
         self.rf_ = RandomForestClassifier(
             n_estimators=self.config.n_estimators,
@@ -224,9 +236,11 @@ class SelfSupervisedRFAnomaly:
             random_state=self.random_state,
         )
 
-        self._log("Fitting self-supervised RF anomaly model")
+        self._log("[rf_pipeline] starting RandomForest fitting")
         self.rf_.fit(X_self_supervised, y_self_supervised)
+        self._log("[rf_pipeline] finished RandomForest fitting")
 
+        self._log("[rf_pipeline] starting validation scoring")
         val_scores = self.score_samples(val_benign)
         self.derived_threshold_ = float(
             np.quantile(val_scores, self.config.threshold_quantile)
@@ -235,6 +249,8 @@ class SelfSupervisedRFAnomaly:
             self.threshold_ = float(self.config.calibrated_threshold)
         else:
             self.threshold_ = self.derived_threshold_
+        self._log(f"[rf_pipeline] derived threshold: {self.derived_threshold_}")
+        self._log(f"[rf_pipeline] final threshold: {self.threshold_}")
 
         return self
 
@@ -261,6 +277,7 @@ class SelfSupervisedRFAnomaly:
         if self.threshold_ is None:
             raise ValueError("Model must be fitted before prediction.")
 
+        self._log("[rf_pipeline] starting test scoring")
         scores = self.score_samples(X)
         preds = (scores > self.threshold_).astype(int)
         return preds, scores

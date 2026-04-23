@@ -58,22 +58,28 @@ def preprocess_with_spark(
     stage_config: dict[str, bool],
 ):
     """Run Spark preprocessing while keeping labels aligned."""
+    print("[runner] starting Spark preprocessing for train")
     train_spark = spark.createDataFrame(attach_labels(X_train, y_train))
+    print("[runner] starting Spark preprocessing for val")
     val_spark = spark.createDataFrame(attach_labels(X_val, y_val))
+    print("[runner] starting Spark preprocessing for test")
     test_spark = spark.createDataFrame(attach_labels(X_test, y_test))
 
     train_processed = run_preprocessing_pipeline(
         train_spark,
         stage_config,
     ).toPandas()
+    print("[runner] finished Spark preprocessing for train")
     val_processed = run_preprocessing_pipeline(
         val_spark,
         stage_config,
     ).toPandas()
+    print("[runner] finished Spark preprocessing for val")
     test_processed = run_preprocessing_pipeline(
         test_spark,
         stage_config,
     ).toPandas()
+    print("[runner] finished Spark preprocessing for test")
 
     return (
         split_features_and_target(train_processed),
@@ -139,12 +145,14 @@ def run_variant(
     spark: Optional[SparkSession] = None,
 ) -> None:
     """Run one preprocessing variant and print its summary."""
+    print(f"[runner] starting variant: {variant_name}")
     train_shape_before = X_train.shape
     val_shape_before = X_val.shape
     test_shape_before = X_test.shape
     stage_config = get_variant_stages(variant_name)
 
     if any(stage_config.values()):
+        print("[runner] variant uses Spark preprocessing")
         (
             (X_train_processed, y_train_processed),
             (X_val_processed, y_val_processed),
@@ -160,6 +168,7 @@ def run_variant(
             stage_config,
         )
     else:
+        print("[runner] variant uses baseline preprocessing")
         X_train_processed = X_train
         y_train_processed = y_train
         X_val_processed = X_val
@@ -167,9 +176,11 @@ def run_variant(
         X_test_processed = X_test
         y_test_processed = y_test
 
+    print("[runner] building benign subsets")
     X_train_benign = X_train_processed.loc[y_train_processed == BENIGN_TARGET]
     X_val_benign = X_val_processed.loc[y_val_processed == BENIGN_TARGET]
 
+    print("[runner] starting RF anomaly pipeline")
     rf_results = run_rf_anomaly_pipeline(
         X_train_processed,
         X_val_processed,
@@ -177,8 +188,10 @@ def run_variant(
         X_train_benign,
         X_val_benign,
     )
+    print("[runner] RF anomaly pipeline completed")
     metrics = calculate_metrics(y_test_processed, rf_results["y_pred"])
 
+    print("[runner] printing final summary")
     print_variant_summary(
         variant_name,
         train_shape_before,
@@ -197,7 +210,9 @@ def main() -> None:
     """Run the selected preprocessing variant summaries."""
     args = parse_args()
     variants = requested_variants(args)
+    print("[runner] loading raw data")
     df = load_raw_data()
+    print("[runner] splitting data")
     splits = split_train_test(df)
     X_train = splits["X_train"]
     y_train = splits["y_train"]
