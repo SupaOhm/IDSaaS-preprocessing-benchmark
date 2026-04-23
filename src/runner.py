@@ -1,9 +1,13 @@
 import argparse
 from typing import Optional
 
+import pandas as pd
 from pyspark.sql import SparkSession
 
+from src.config import BENIGN_TARGET, NORMALIZED_LABEL_COLUMN
+from src.evaluate import calculate_metrics
 from src.load_data import load_raw_data
+from src.rf_pipeline import run_rf_anomaly_pipeline
 from src.spark_pipeline.pipeline import run_preprocessing_pipeline
 from src.split import split_train_test
 from src.variants import VARIANT_STAGES, get_variant_stages
@@ -46,29 +50,53 @@ def create_spark_session() -> SparkSession:
 def preprocess_with_spark(
     spark: SparkSession,
     X_train,
+    y_train,
     X_val,
+    y_val,
     X_test,
+    y_test,
     stage_config: dict[str, bool],
 ):
-    """Run Spark preprocessing for train, validation, and test feature frames."""
-    train_spark = spark.createDataFrame(X_train)
-    val_spark = spark.createDataFrame(X_val)
-    test_spark = spark.createDataFrame(X_test)
+    """Run Spark preprocessing while keeping labels aligned."""
+    train_spark = spark.createDataFrame(attach_labels(X_train, y_train))
+    val_spark = spark.createDataFrame(attach_labels(X_val, y_val))
+    test_spark = spark.createDataFrame(attach_labels(X_test, y_test))
 
-    X_train_processed = run_preprocessing_pipeline(
+    train_processed = run_preprocessing_pipeline(
         train_spark,
         stage_config,
     ).toPandas()
-    X_val_processed = run_preprocessing_pipeline(
+    val_processed = run_preprocessing_pipeline(
         val_spark,
         stage_config,
     ).toPandas()
-    X_test_processed = run_preprocessing_pipeline(
+    test_processed = run_preprocessing_pipeline(
         test_spark,
         stage_config,
     ).toPandas()
 
-    return X_train_processed, X_val_processed, X_test_processed
+    return (
+        split_features_and_target(train_processed),
+        split_features_and_target(val_processed),
+        split_features_and_target(test_processed),
+    )
+
+
+def attach_labels(X: pd.DataFrame, y: pd.Series) -> pd.DataFrame:
+    """Attach the target series as the normalized label column."""
+    df = X.copy()
+    df[NORMALIZED_LABEL_COLUMN] = y.values
+    return df
+
+
+def split_features_and_target(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
+    """Split a processed DataFrame back into features and numeric target."""
+    if NORMALIZED_LABEL_COLUMN not in df.columns:
+        raise ValueError(f"Missing required column after preprocessing: {NORMALIZED_LABEL_COLUMN}")
+
+    y = pd.to_numeric(df[NORMALIZED_LABEL_COLUMN], errors="raise")
+    X = df.drop(columns=[NORMALIZED_LABEL_COLUMN])
+    return X, y
 
 
 def print_variant_summary(
@@ -79,6 +107,9 @@ def print_variant_summary(
     train_shape_after: tuple[int, int],
     val_shape_after: tuple[int, int],
     test_shape_after: tuple[int, int],
+    metrics: dict[str, float],
+    threshold: float,
+    derived_threshold: float,
 ) -> None:
     """Print a simple variant summary."""
     print(f"variant: {variant_name}")
@@ -88,14 +119,23 @@ def print_variant_summary(
     print(f"X_train after preprocessing: {train_shape_after}")
     print(f"X_val after preprocessing: {val_shape_after}")
     print(f"X_test after preprocessing: {test_shape_after}")
+    print(f"accuracy: {metrics['accuracy']}")
+    print(f"precision: {metrics['precision']}")
+    print(f"recall: {metrics['recall']}")
+    print(f"f1: {metrics['f1']}")
+    print(f"threshold: {threshold}")
+    print(f"derived_threshold: {derived_threshold}")
     print()
 
 
 def run_variant(
     variant_name: str,
     X_train,
+    y_train,
     X_val,
+    y_val,
     X_test,
+    y_test,
     spark: Optional[SparkSession] = None,
 ) -> None:
     """Run one preprocessing variant and print its summary."""
@@ -105,17 +145,39 @@ def run_variant(
     stage_config = get_variant_stages(variant_name)
 
     if any(stage_config.values()):
-        X_train_processed, X_val_processed, X_test_processed = preprocess_with_spark(
+        (
+            (X_train_processed, y_train_processed),
+            (X_val_processed, y_val_processed),
+            (X_test_processed, y_test_processed),
+        ) = preprocess_with_spark(
             spark,
             X_train,
+            y_train,
             X_val,
+            y_val,
             X_test,
+            y_test,
             stage_config,
         )
     else:
         X_train_processed = X_train
+        y_train_processed = y_train
         X_val_processed = X_val
+        y_val_processed = y_val
         X_test_processed = X_test
+        y_test_processed = y_test
+
+    X_train_benign = X_train_processed.loc[y_train_processed == BENIGN_TARGET]
+    X_val_benign = X_val_processed.loc[y_val_processed == BENIGN_TARGET]
+
+    rf_results = run_rf_anomaly_pipeline(
+        X_train_processed,
+        X_val_processed,
+        X_test_processed,
+        X_train_benign,
+        X_val_benign,
+    )
+    metrics = calculate_metrics(y_test_processed, rf_results["y_pred"])
 
     print_variant_summary(
         variant_name,
@@ -125,6 +187,9 @@ def run_variant(
         X_train_processed.shape,
         X_val_processed.shape,
         X_test_processed.shape,
+        metrics,
+        rf_results["threshold"],
+        rf_results["derived_threshold"],
     )
 
 
@@ -135,14 +200,26 @@ def main() -> None:
     df = load_raw_data()
     splits = split_train_test(df)
     X_train = splits["X_train"]
+    y_train = splits["y_train"]
     X_val = splits["X_val"]
+    y_val = splits["y_val"]
     X_test = splits["X_test"]
+    y_test = splits["y_test"]
     needs_spark = any(any(get_variant_stages(variant).values()) for variant in variants)
     spark = create_spark_session() if needs_spark else None
 
     try:
         for variant_name in variants:
-            run_variant(variant_name, X_train, X_val, X_test, spark)
+            run_variant(
+                variant_name,
+                X_train,
+                y_train,
+                X_val,
+                y_val,
+                X_test,
+                y_test,
+                spark,
+            )
     finally:
         if spark is not None:
             spark.stop()
