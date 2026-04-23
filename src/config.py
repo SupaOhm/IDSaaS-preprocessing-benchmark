@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from pathlib import Path
 
 
@@ -24,3 +25,30 @@ EXPERIMENT_VARIANTS = (
     "parse_norm",
     "parse_norm_clean",
 )
+
+
+@dataclass
+class RFConfig:
+    n_svd_components: int = 64
+    n_rff_components: int = 192
+    rff_gamma: float = 0.10
+    n_rotations: int = 8
+    n_estimators: int = 200
+    max_depth: int | None = 20
+    min_samples_leaf: int = 2
+    n_jobs: int = 8
+    threshold_quantile: float = 0.97
+    calibrated_threshold: float | None = 0.8042
+    use_calibrated_threshold: bool = False
+    exclude_columns: tuple[str, ...] = (
+        "Flow ID",
+        "flow_id",
+        "Source IP",
+        "source_ip",
+        "Destination IP",
+        "destination_ip",
+        "Timestamp",
+        "timestamp",
+        "SimillarHTTP",
+        "simillarhttp",
+    )
