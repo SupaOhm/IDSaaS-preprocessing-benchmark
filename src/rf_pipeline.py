@@ -1,3 +1,7 @@
+import time
+from pathlib import Path
+
+import joblib
 import numpy as np
 from sklearn.compose import ColumnTransformer
 from sklearn.decomposition import TruncatedSVD
@@ -119,6 +123,9 @@ class SelfSupervisedRFAnomaly:
         self.rf_ = None
         self.threshold_ = None
         self.derived_threshold_ = None
+        self.training_time_ = None
+        self.validation_scoring_time_ = None
+        self.test_scoring_time_ = None
 
     def _log(self, message: str) -> None:
         """Print a short progress message when verbose logging is enabled."""
@@ -168,24 +175,12 @@ class SelfSupervisedRFAnomaly:
     def fit(self, X_train_benign, X_val_benign):
         """Fit the benign-only self-supervised anomaly model."""
         set_random_seed(self.random_state)
+        fit_start = time.perf_counter()
         train_benign = X_train_benign
         val_benign = X_val_benign
         self._log(
             f"[rf_pipeline] fit start: benign_train={len(train_benign)}, benign_val={len(val_benign)}"
         )
-
-        if len(train_benign) > 450000:
-            self._log("[rf_pipeline] downsampling benign train to 450000")
-            train_benign = train_benign.sample(
-                n=450000,
-                random_state=self.random_state,
-            )
-        if len(val_benign) > 120000:
-            self._log("[rf_pipeline] downsampling benign val to 120000")
-            val_benign = val_benign.sample(
-                n=120000,
-                random_state=self.random_state,
-            )
 
         self.feature_columns_ = select_feature_columns(
             train_benign,
@@ -233,44 +228,46 @@ class SelfSupervisedRFAnomaly:
             max_depth=self.config.max_depth,
             min_samples_leaf=self.config.min_samples_leaf,
             n_jobs=self.config.n_jobs,
+            class_weight="balanced",
             random_state=self.random_state,
         )
 
         self._log("[rf_pipeline] starting RandomForest fitting")
         self.rf_.fit(X_self_supervised, y_self_supervised)
         self._log("[rf_pipeline] finished RandomForest fitting")
+        self.training_time_ = time.perf_counter() - fit_start
 
-        self._log("[rf_pipeline] starting validation scoring")
-        val_scores = self.score_samples(val_benign)
+        self._log("[rf_pipeline] starting benign-train scoring for threshold")
+        train_scores = self.score_samples(train_benign)
         self.derived_threshold_ = float(
-            np.quantile(val_scores, self.config.threshold_quantile)
+            np.quantile(train_scores, self.config.threshold_quantile)
         )
-        if self.config.use_calibrated_threshold:
+        if self.config.use_calibrated_threshold and self.config.calibrated_threshold is not None:
             self.threshold_ = float(self.config.calibrated_threshold)
         else:
             self.threshold_ = self.derived_threshold_
         self._log(f"[rf_pipeline] derived threshold: {self.derived_threshold_}")
         self._log(f"[rf_pipeline] final threshold: {self.threshold_}")
+        self._log("[rf_pipeline] starting benign-val scoring")
+        validation_start = time.perf_counter()
+        self.score_samples(val_benign)
+        self.validation_scoring_time_ = time.perf_counter() - validation_start
 
         return self
 
     def score_samples(self, X) -> np.ndarray:
-        """Return anomaly scores where larger values are more anomalous."""
+        """Return anomaly scores using the identity-rotation probability."""
         transformed = self._apply_transform_chain(X)
-        expected_probabilities = []
+        probabilities = self.rf_.predict_proba(transformed)
+        class_index = np.where(self.rf_.classes_ == 0)[0]
 
-        for label, rotation in enumerate(self.rotations_):
-            rotated = transformed @ rotation
-            probabilities = self.rf_.predict_proba(rotated)
-            class_index = np.where(self.rf_.classes_ == label)[0]
+        if len(class_index) == 0:
+            identity_probability = np.full(transformed.shape[0], 1e-12, dtype=np.float32)
+        else:
+            identity_probability = probabilities[:, class_index[0]]
 
-            if len(class_index) == 0:
-                expected_probabilities.append(np.zeros(rotated.shape[0]))
-            else:
-                expected_probabilities.append(probabilities[:, class_index[0]])
-
-        mean_expected_probability = np.mean(expected_probabilities, axis=0)
-        return 1.0 - mean_expected_probability
+        identity_probability = np.clip(identity_probability, 1e-12, 1.0)
+        return -np.log(identity_probability)
 
     def predict(self, X) -> tuple[np.ndarray, np.ndarray]:
         """Predict binary anomaly labels using the fitted threshold."""
@@ -278,9 +275,23 @@ class SelfSupervisedRFAnomaly:
             raise ValueError("Model must be fitted before prediction.")
 
         self._log("[rf_pipeline] starting test scoring")
+        test_start = time.perf_counter()
         scores = self.score_samples(X)
+        self.test_scoring_time_ = time.perf_counter() - test_start
         preds = (scores > self.threshold_).astype(int)
         return preds, scores
+
+    def save(self, path) -> Path:
+        """Save the trained model with joblib."""
+        save_path = Path(path)
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        joblib.dump(self, save_path)
+        return save_path
+
+    @classmethod
+    def load(cls, path):
+        """Load a trained model with joblib."""
+        return joblib.load(path)
 
 
 def run_rf_anomaly_pipeline(
@@ -303,8 +314,17 @@ def run_rf_anomaly_pipeline(
 
     return {
         "model": model,
+        "model_name": "rf",
         "y_pred": y_pred,
         "scores": scores,
         "threshold": model.threshold_,
         "derived_threshold": model.derived_threshold_,
+        "training_time": model.training_time_,
+        "validation_scoring_time": model.validation_scoring_time_,
+        "test_scoring_time": model.test_scoring_time_,
+        "model_info": {
+            "n_estimators": model.config.n_estimators,
+            "n_features": len(model.feature_columns_),
+            "n_rotations": model.config.n_rotations,
+        },
     }

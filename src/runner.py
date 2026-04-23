@@ -1,10 +1,11 @@
 import argparse
+from pathlib import Path
 from typing import Optional
 
 import pandas as pd
 from pyspark.sql import SparkSession
 
-from src.config import BENIGN_TARGET, NORMALIZED_LABEL_COLUMN
+from src.config import BENIGN_TARGET, INTERMEDIATE_DIR, NORMALIZED_LABEL_COLUMN, RANDOM_SEED
 from src.evaluate import calculate_metrics
 from src.load_data import load_raw_data
 from src.rf_pipeline import run_rf_anomaly_pipeline
@@ -13,9 +14,12 @@ from src.split import split_train_test
 from src.variants import VARIANT_STAGES, get_variant_stages
 
 
+MODEL_OUTPUT_DIR = INTERMEDIATE_DIR / "models"
+
+
 def parse_args() -> argparse.Namespace:
     """Parse command-line arguments."""
-    parser = argparse.ArgumentParser(description="Run IDSaaS preprocessing benchmark.")
+    parser = argparse.ArgumentParser(description="Run IDSaaS anomaly-branch benchmark.")
     parser.add_argument(
         "--variant",
         choices=tuple(VARIANT_STAGES),
@@ -26,6 +30,13 @@ def parse_args() -> argparse.Namespace:
         "--run-all",
         action="store_true",
         help="Run all supported variants.",
+    )
+    parser.add_argument(
+        "--seeds",
+        nargs="+",
+        type=int,
+        default=[RANDOM_SEED],
+        help="One or more random seeds to run.",
     )
     return parser.parse_args()
 
@@ -41,7 +52,7 @@ def requested_variants(args: argparse.Namespace) -> list[str]:
 def create_spark_session() -> SparkSession:
     """Create a local Spark session for preprocessing."""
     return (
-        SparkSession.builder.appName("IDSaaSPreprocessingBenchmark")
+        SparkSession.builder.appName("IDSaaSAnomalyBranchBenchmark")
         .master("local[*]")
         .getOrCreate()
     )
@@ -105,20 +116,29 @@ def split_features_and_target(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series
     return X, y
 
 
+def save_trained_model(model, variant_name: str, seed: int) -> Path:
+    """Save a trained anomaly model."""
+    model_path = MODEL_OUTPUT_DIR / f"{variant_name}_seed{seed}.joblib"
+    return model.save(model_path)
+
+
 def print_variant_summary(
     variant_name: str,
+    seed: int,
     train_shape_before: tuple[int, int],
     val_shape_before: tuple[int, int],
     test_shape_before: tuple[int, int],
     train_shape_after: tuple[int, int],
     val_shape_after: tuple[int, int],
     test_shape_after: tuple[int, int],
-    metrics: dict[str, float],
-    threshold: float,
-    derived_threshold: float,
+    metrics: dict[str, float | int | None],
+    results: dict,
+    model_path: Path,
 ) -> None:
-    """Print a simple variant summary."""
+    """Print a comparable experiment summary."""
     print(f"variant: {variant_name}")
+    print("model: rf_anomaly")
+    print(f"seed: {seed}")
     print(f"X_train before preprocessing: {train_shape_before}")
     print(f"X_val before preprocessing: {val_shape_before}")
     print(f"X_test before preprocessing: {test_shape_before}")
@@ -129,13 +149,25 @@ def print_variant_summary(
     print(f"precision: {metrics['precision']}")
     print(f"recall: {metrics['recall']}")
     print(f"f1: {metrics['f1']}")
-    print(f"threshold: {threshold}")
-    print(f"derived_threshold: {derived_threshold}")
+    print(f"roc_auc: {metrics['roc_auc']}")
+    print(f"pr_auc: {metrics['pr_auc']}")
+    print(f"tn: {metrics['tn']}")
+    print(f"fp: {metrics['fp']}")
+    print(f"fn: {metrics['fn']}")
+    print(f"tp: {metrics['tp']}")
+    print(f"threshold: {results['threshold']}")
+    print(f"derived_threshold: {results['derived_threshold']}")
+    print(f"training_time: {results['training_time']}")
+    print(f"validation_scoring_time: {results['validation_scoring_time']}")
+    print(f"test_scoring_time: {results['test_scoring_time']}")
+    print(f"model_info: {results['model_info']}")
+    print(f"model_path: {model_path}")
     print()
 
 
 def run_variant(
     variant_name: str,
+    seed: int,
     X_train,
     y_train,
     X_val,
@@ -144,8 +176,8 @@ def run_variant(
     y_test,
     spark: Optional[SparkSession] = None,
 ) -> None:
-    """Run one preprocessing variant and print its summary."""
-    print(f"[runner] starting variant: {variant_name}")
+    """Run one preprocessing variant for the anomaly branch."""
+    print(f"[runner] starting variant: {variant_name} (seed={seed})")
     train_shape_before = X_train.shape
     val_shape_before = X_val.shape
     test_shape_before = X_test.shape
@@ -181,19 +213,24 @@ def run_variant(
     X_val_benign = X_val_processed.loc[y_val_processed == BENIGN_TARGET]
 
     print("[runner] starting RF anomaly pipeline")
-    rf_results = run_rf_anomaly_pipeline(
+    results = run_rf_anomaly_pipeline(
         X_train_processed,
         X_val_processed,
         X_test_processed,
         X_train_benign,
         X_val_benign,
+        random_state=seed,
     )
     print("[runner] RF anomaly pipeline completed")
-    metrics = calculate_metrics(y_test_processed, rf_results["y_pred"])
+    print("[runner] saving trained model")
+    model_path = save_trained_model(results["model"], variant_name, seed)
+    print(f"[runner] model saved to {model_path}")
+    metrics = calculate_metrics(y_test_processed, results["y_pred"], scores=results["scores"])
 
     print("[runner] printing final summary")
     print_variant_summary(
         variant_name,
+        seed,
         train_shape_before,
         val_shape_before,
         test_shape_before,
@@ -201,40 +238,43 @@ def run_variant(
         X_val_processed.shape,
         X_test_processed.shape,
         metrics,
-        rf_results["threshold"],
-        rf_results["derived_threshold"],
+        results,
+        model_path,
     )
 
 
 def main() -> None:
-    """Run the selected preprocessing variant summaries."""
+    """Run the selected anomaly-branch variants."""
     args = parse_args()
     variants = requested_variants(args)
     print("[runner] loading raw data")
     df = load_raw_data()
-    print("[runner] splitting data")
-    splits = split_train_test(df)
-    X_train = splits["X_train"]
-    y_train = splits["y_train"]
-    X_val = splits["X_val"]
-    y_val = splits["y_val"]
-    X_test = splits["X_test"]
-    y_test = splits["y_test"]
     needs_spark = any(any(get_variant_stages(variant).values()) for variant in variants)
     spark = create_spark_session() if needs_spark else None
 
     try:
-        for variant_name in variants:
-            run_variant(
-                variant_name,
-                X_train,
-                y_train,
-                X_val,
-                y_val,
-                X_test,
-                y_test,
-                spark,
-            )
+        for seed in args.seeds:
+            print(f"[runner] splitting data for seed {seed}")
+            splits = split_train_test(df, random_state=seed)
+            X_train = splits["X_train"]
+            y_train = splits["y_train"]
+            X_val = splits["X_val"]
+            y_val = splits["y_val"]
+            X_test = splits["X_test"]
+            y_test = splits["y_test"]
+
+            for variant_name in variants:
+                run_variant(
+                    variant_name,
+                    seed,
+                    X_train,
+                    y_train,
+                    X_val,
+                    y_val,
+                    X_test,
+                    y_test,
+                    spark,
+                )
     finally:
         if spark is not None:
             spark.stop()
