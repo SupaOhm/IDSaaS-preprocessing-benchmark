@@ -46,15 +46,21 @@ def create_spark_session() -> SparkSession:
 def preprocess_with_spark(
     spark: SparkSession,
     X_train,
+    X_val,
     X_test,
     stage_config: dict[str, bool],
 ):
-    """Run Spark preprocessing for train and test feature frames."""
+    """Run Spark preprocessing for train, validation, and test feature frames."""
     train_spark = spark.createDataFrame(X_train)
+    val_spark = spark.createDataFrame(X_val)
     test_spark = spark.createDataFrame(X_test)
 
     X_train_processed = run_preprocessing_pipeline(
         train_spark,
+        stage_config,
+    ).toPandas()
+    X_val_processed = run_preprocessing_pipeline(
+        val_spark,
         stage_config,
     ).toPandas()
     X_test_processed = run_preprocessing_pipeline(
@@ -62,21 +68,25 @@ def preprocess_with_spark(
         stage_config,
     ).toPandas()
 
-    return X_train_processed, X_test_processed
+    return X_train_processed, X_val_processed, X_test_processed
 
 
 def print_variant_summary(
     variant_name: str,
     train_shape_before: tuple[int, int],
+    val_shape_before: tuple[int, int],
     test_shape_before: tuple[int, int],
     train_shape_after: tuple[int, int],
+    val_shape_after: tuple[int, int],
     test_shape_after: tuple[int, int],
 ) -> None:
     """Print a simple variant summary."""
     print(f"variant: {variant_name}")
     print(f"X_train before preprocessing: {train_shape_before}")
+    print(f"X_val before preprocessing: {val_shape_before}")
     print(f"X_test before preprocessing: {test_shape_before}")
     print(f"X_train after preprocessing: {train_shape_after}")
+    print(f"X_val after preprocessing: {val_shape_after}")
     print(f"X_test after preprocessing: {test_shape_after}")
     print()
 
@@ -84,30 +94,36 @@ def print_variant_summary(
 def run_variant(
     variant_name: str,
     X_train,
+    X_val,
     X_test,
     spark: Optional[SparkSession] = None,
 ) -> None:
     """Run one preprocessing variant and print its summary."""
     train_shape_before = X_train.shape
+    val_shape_before = X_val.shape
     test_shape_before = X_test.shape
     stage_config = get_variant_stages(variant_name)
 
     if any(stage_config.values()):
-        X_train_processed, X_test_processed = preprocess_with_spark(
+        X_train_processed, X_val_processed, X_test_processed = preprocess_with_spark(
             spark,
             X_train,
+            X_val,
             X_test,
             stage_config,
         )
     else:
         X_train_processed = X_train
+        X_val_processed = X_val
         X_test_processed = X_test
 
     print_variant_summary(
         variant_name,
         train_shape_before,
+        val_shape_before,
         test_shape_before,
         X_train_processed.shape,
+        X_val_processed.shape,
         X_test_processed.shape,
     )
 
@@ -117,13 +133,16 @@ def main() -> None:
     args = parse_args()
     variants = requested_variants(args)
     df = load_raw_data()
-    X_train, X_test, _y_train, _y_test = split_train_test(df)
+    splits = split_train_test(df)
+    X_train = splits["X_train"]
+    X_val = splits["X_val"]
+    X_test = splits["X_test"]
     needs_spark = any(any(get_variant_stages(variant).values()) for variant in variants)
     spark = create_spark_session() if needs_spark else None
 
     try:
         for variant_name in variants:
-            run_variant(variant_name, X_train, X_test, spark)
+            run_variant(variant_name, X_train, X_val, X_test, spark)
     finally:
         if spark is not None:
             spark.stop()
