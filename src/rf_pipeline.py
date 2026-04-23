@@ -83,6 +83,20 @@ def build_tabular_preprocessor(
     return ColumnTransformer(transformers=transformers)
 
 
+def sanitize_numeric_features(df, feature_columns):
+    """Replace infinite numeric values with NaN in selected feature columns."""
+    sanitized = df.copy()
+    numeric_columns, _ = infer_numeric_and_categorical(sanitized, feature_columns)
+
+    if numeric_columns:
+        sanitized.loc[:, numeric_columns] = sanitized.loc[:, numeric_columns].replace(
+            [np.inf, -np.inf],
+            np.nan,
+        )
+
+    return sanitized
+
+
 class SelfSupervisedRFAnomaly:
     """Self-supervised benign-only RF anomaly detector."""
 
@@ -134,7 +148,8 @@ class SelfSupervisedRFAnomaly:
 
     def _apply_transform_chain(self, X) -> np.ndarray:
         """Apply preprocessor, SVD, and RFF transforms."""
-        transformed = self.preprocessor_.transform(X[self.feature_columns_])
+        sanitized = sanitize_numeric_features(X, self.feature_columns_)
+        transformed = self.preprocessor_.transform(sanitized[self.feature_columns_])
         transformed = self.svd_.transform(transformed)
         transformed = self.rff_.transform(transformed)
         return self._to_dense(transformed).astype(np.float32)
@@ -178,6 +193,7 @@ class SelfSupervisedRFAnomaly:
         )
 
         self._log("Fitting RF anomaly preprocessor")
+        train_benign = sanitize_numeric_features(train_benign, self.feature_columns_)
         train_prepared = self.preprocessor_.fit_transform(train_benign[self.feature_columns_])
         svd_components = min(
             self.config.n_svd_components,
