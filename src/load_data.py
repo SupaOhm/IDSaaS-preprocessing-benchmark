@@ -66,8 +66,3 @@ def load_raw_data_with_source() -> pd.DataFrame:
 def load_raw_data() -> pd.DataFrame:
     """Load and concatenate all raw CSV files."""
     return load_raw_data_with_source()
-
-
-def create_spark_dataframe(spark, df: pd.DataFrame):
-    """Convert a pandas DataFrame into a Spark DataFrame."""
-    return spark.createDataFrame(df)
