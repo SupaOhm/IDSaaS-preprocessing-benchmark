@@ -47,8 +47,8 @@ def load_csv_file(csv_path: Path) -> pd.DataFrame:
         return pd.read_csv(path, encoding="latin1")
 
 
-def load_raw_data() -> pd.DataFrame:
-    """Load and concatenate all raw CSV files."""
+def load_raw_data_with_source() -> pd.DataFrame:
+    """Load and concatenate all raw CSV files with source filenames."""
     csv_files = discover_csv_files(RAW_DATA_DIR)
     if not csv_files:
         raise FileNotFoundError(f"No CSV files found in {RAW_DATA_DIR}")
@@ -61,3 +61,13 @@ def load_raw_data() -> pd.DataFrame:
         frames.append(df)
 
     return pd.concat(frames, ignore_index=True)
+
+
+def load_raw_data() -> pd.DataFrame:
+    """Load and concatenate all raw CSV files."""
+    return load_raw_data_with_source()
+
+
+def create_spark_dataframe(spark, df: pd.DataFrame):
+    """Convert a pandas DataFrame into a Spark DataFrame."""
+    return spark.createDataFrame(df)
